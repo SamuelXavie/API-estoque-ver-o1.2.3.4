@@ -1,0 +1,7 @@
+# Dependências do projeto - Módulo de Estoque
+# Instale com: pip install -r requirements.txt
+
+fastapi==0.115.12
+uvicorn==0.34.0
+asyncpg==0.30.0
+python-dotenv==1.1.0
