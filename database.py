@@ -28,11 +28,28 @@ async def criar_pool() -> None:
     global _pool
 
     try:
+        # Detecta se deve usar SSL: variável DATABASE_SSL (true/false) ou
+        # ativa por padrão quando a URL aparenta ser do Supabase.
+        database_url = os.getenv("DATABASE_URL")
+        database_ssl_env = os.getenv("DATABASE_SSL", "auto").lower()
+
+        if database_ssl_env in ("1", "true", "yes"):
+            ssl_ctx = ssl.create_default_context()
+        elif database_ssl_env == "auto" and database_url and "supabase.co" in database_url:
+            ssl_ctx = ssl.create_default_context()
+        else:
+            ssl_ctx = False
+
+        # Permite desabilitar a verificação de certificado via env (apenas para testes).
+        if ssl_ctx and os.getenv("DATABASE_SSL_NO_VERIFY", "false").lower() in ("1", "true", "yes"):
+            ssl_ctx.check_hostname = False
+            ssl_ctx.verify_mode = ssl.CERT_NONE
+
         _pool = await asyncpg.create_pool(
-            dsn=os.getenv("DATABASE_URL"),
+            dsn=database_url,
             min_size=1,
             max_size=5,
-            ssl=False,
+            ssl=ssl_ctx,
         )
         print("✅ Pool de conexões criado com sucesso!")
     except Exception as e:

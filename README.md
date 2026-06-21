@@ -152,27 +152,32 @@ CREATE INDEX IF NOT EXISTS idx_movimentacao_estoque ON movimentacao_estoque(esto
 
 ## 🚀 Executando a API
 
-### Modo Desenvolvimento
-```bash
-source venv/bin/activate
-uvicorn main:app --reload
-```
-
-**Output esperado:**
-```
-INFO:     Uvicorn running on http://127.0.0.1:8000
-INFO:     Started reloader process
-```
-
-### Modo Produção
-```bash
-uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
-```
-
-### Script Automatizado
+### Usando o script automatizado
 ```bash
 ./start.sh
 ```
+
+Este script faz:
+- validação do arquivo `.env`
+- instalação das dependências em `venv`
+- verificação do Supabase usando `SUPABASE_SERVICE_ROLE_KEY`
+- inicialização do servidor em `127.0.0.1:8000`
+- se `8000` estiver ocupada, ele usa a primeira porta livre de `8000` a `8009`
+
+### Forçar porta
+```bash
+PORT=8002 ./start.sh
+```
+
+### Rodando manualmente
+```bash
+source venv/bin/activate
+./venv/bin/python -m uvicorn main:app --reload --host 127.0.0.1 --port 8000
+```
+
+### Documentação e healthcheck
+- Documentação Swagger: `http://127.0.0.1:8000/docs`
+- Health: `http://127.0.0.1:8000/health`
 
 ---
 
@@ -304,11 +309,23 @@ Deleta um estoque.
 Lista todas as movimentações.
 
 #### `POST /movimentacoes`
-Registra uma entrada ou saída (atualiza estoque automaticamente).
+Registra uma entrada ou saída (atualiza estoque automaticamente). O endpoint também aceita o alias `/movimentacao`.
 
 **Entrada:**
 ```bash
 curl -X POST http://localhost:8000/movimentacoes \
+  -H "Content-Type: application/json" \
+  -d '{
+    "estoque_id": "550e8400-e29b-41d4-a716-446655440001",
+    "tipo": "entrada",
+    "quantidade": 50,
+    "observacao": "Recebimento NF-12345"
+  }'
+```
+
+Ou:
+```bash
+curl -X POST http://localhost:8000/movimentacao \
   -H "Content-Type: application/json" \
   -d '{
     "estoque_id": "550e8400-e29b-41d4-a716-446655440001",

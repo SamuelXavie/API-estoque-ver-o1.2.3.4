@@ -8,10 +8,16 @@ Tabelas cobertas (escopo do grupo de Estoque):
   - movimentacao_estoque
 """
 
-from pydantic import BaseModel, Field
+from enum import Enum
+from pydantic import BaseModel, Field, validator
 from typing import Optional
 from datetime import datetime
 import uuid
+
+
+class MovimentacaoTipo(str, Enum):
+    entrada = "entrada"
+    saida = "saida"
 
 
 # ══════════════════════════════════════════════════════════════
@@ -73,10 +79,25 @@ class LocalFisicoResposta(LocalFisicoBase):
 # ══════════════════════════════════════════════════════════════
 
 class MovimentacaoBase(BaseModel):
-    estoque_id: uuid.UUID     = Field(..., description="ID do registro de estoque movimentado")
-    tipo:       str           = Field(..., description="Tipo da movimentação: 'entrada' ou 'saida'")
-    quantidade: int           = Field(..., gt=0, description="Quantidade movimentada (sempre positivo)")
-    observacao: Optional[str] = Field(None, description="Motivo ou observação da movimentação")
+    estoque_id: uuid.UUID         = Field(..., description="ID do registro de estoque movimentado")
+    tipo:       MovimentacaoTipo  = Field(..., description="Tipo da movimentação: 'entrada' ou 'saida'")
+    quantidade: int               = Field(..., gt=0, description="Quantidade movimentada (sempre positivo)")
+    observacao: Optional[str]     = Field(None, description="Motivo ou observação da movimentação")
+
+    @validator("tipo", pre=True)
+    def normalize_tipo(cls, value):
+        # CORRIGIDO: sem este check, quando o Pydantic passa um MovimentacaoTipo
+        # já instanciado (ex: em respostas ou revalidações internas), o validator
+        # ignorava o isinstance(str) e caía direto no raise ValueError.
+        if isinstance(value, MovimentacaoTipo):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized == "entrada":
+                return MovimentacaoTipo.entrada
+            if normalized in ("saida", "saída"):
+                return MovimentacaoTipo.saida
+        raise ValueError("Tipo deve ser 'entrada' ou 'saida'.")
 
 class MovimentacaoCriar(MovimentacaoBase):
     pass
@@ -84,7 +105,7 @@ class MovimentacaoCriar(MovimentacaoBase):
 class MovimentacaoAtualizar(BaseModel):
     # Movimentações raramente são editadas; disponibilizamos PUT apenas
     # para correção de observação ou tipo, nunca da quantidade já registrada.
-    tipo:       Optional[str] = None
+    tipo:       Optional[MovimentacaoTipo] = None
     observacao: Optional[str] = None
 
 class MovimentacaoResposta(MovimentacaoBase):

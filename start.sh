@@ -34,41 +34,46 @@ echo "📚 Instalando dependências..."
 pip install -q -r requirements.txt
 echo "✅ Dependências instaladas"
 
-# Verificar conexão com PostgreSQL
-echo "🔍 Verificando conexão com PostgreSQL..."
-python -c "
-import asyncpg
-import asyncio
-import os
-from dotenv import load_dotenv
-
-load_dotenv()
-
-async def check_db():
-    try:
-        conn = await asyncpg.connect(os.getenv('DATABASE_URL'))
-        await conn.close()
-        print('✅ Banco de dados conectado!')
-        return True
-    except Exception as e:
-        print(f'❌ Erro ao conectar: {e}')
-        return False
-
-result = asyncio.run(check_db())
-exit(0 if result else 1)
-" || exit 1
+echo "🔍 Verificando credenciais do Supabase..."
+python scripts/check_supabase.py || exit 1
 
 # Iniciar servidor
+PORT=${PORT:-8000}
+BASE_PORT=$PORT
+
+FREE_PORT=$(python - "$PORT" <<'PY'
+import socket, sys
+port_start = int(sys.argv[1])
+for port in range(port_start, port_start + 10):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(('127.0.0.1', port))
+            print(port)
+            break
+        except OSError:
+            continue
+else:
+    raise SystemExit('Nenhuma porta livre encontrada entre {} e {}'.format(port_start, port_start + 9))
+PY
+)
+
+PORT=$FREE_PORT
+
+if [ "$PORT" != "$BASE_PORT" ]; then
+    echo "⚠️  Porta $BASE_PORT ocupada. Iniciando em http://127.0.0.1:$PORT"
+fi
+
 echo ""
-echo "════════════════════════════════════════════════════════════"
+echo "════════════════════════════════════════════════════════════════════"
 echo "🎉 API Iniciada!"
-echo "════════════════════════════════════════════════════════════"
+echo "════════════════════════════════════════════════════════════════════"
 echo ""
-echo "📚 Documentação: http://localhost:8000/docs"
-echo "🏠 Página Inicial: http://localhost:8000/"
-echo "❤️  Health Check: http://localhost:8000/health"
+echo "📚 Documentação: http://127.0.0.1:$PORT/docs"
+echo "🏠 Página Inicial: http://127.0.0.1:$PORT/"
+echo "❤️  Health Check: http://127.0.0.1:$PORT/health"
 echo ""
 echo "Pressione Ctrl+C para parar..."
 echo ""
 
-uvicorn main:app --reload
+uvicorn main:app --reload --host 127.0.0.1 --port "$PORT"

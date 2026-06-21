@@ -24,7 +24,7 @@ cp .env.example .env
 
 # Edite o arquivo .env com suas credenciais do PostgreSQL
 # Exemplo de conteúdo para .env:
-# DATABASE_URL=postgresql://postgres:sua_senha@localhost:5432/estoque_db
+# DATABASE_URL=postgresql://estoque_user:estoque_pass@localhost:5432/estoque_db
 ```
 
 ---
@@ -51,6 +51,8 @@ psql -U postgres
 
 # Dentro do psql:
 CREATE DATABASE estoque_db;
+CREATE ROLE estoque_user WITH LOGIN PASSWORD 'estoque_pass';
+GRANT ALL PRIVILEGES ON DATABASE estoque_db TO estoque_user;
 \q
 ```
 

@@ -13,25 +13,58 @@ main.py
 =============================================================
 """
 
+from enum import Enum
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from typing import List
 import uuid
 
-from database import criar_pool, fechar_pool, get_pool
-# Alterar: DATABASE_URL=postgresql://postgres:SUA_SENHA@localhost:5432/estoque_dbl
+from supabase_client import criar_supabase, fechar_supabase, get_supabase
+from starlette.concurrency import run_in_threadpool
 from schemas import (
     EstoqueCriar, EstoqueAtualizar, EstoqueResposta,
     LocalFisicoCriar, LocalFisicoAtualizar, LocalFisicoResposta,
     MovimentacaoCriar, MovimentacaoAtualizar, MovimentacaoResposta,
+    MovimentacaoTipo,
 )
+
+
+def _normalize_payload(payload: dict) -> dict:
+    for k, v in list(payload.items()):
+        if isinstance(v, uuid.UUID):
+            payload[k] = str(v)
+        elif isinstance(v, Enum):
+            payload[k] = v.value
+    return payload
+
+
+def _unwrap(res):
+    """Normalize Supabase response (object or dict) to {'data', 'error'}."""
+    if res is None:
+        return {'data': None, 'error': 'no response'}
+    if isinstance(res, dict):
+        return {'data': res.get('data'), 'error': res.get('error')}
+    return {'data': getattr(res, 'data', None), 'error': getattr(res, 'error', None)}
+
+
+# CORRIGIDO: era síncrona, agora async com run_in_threadpool para não bloquear
+# o event loop e retornar resultado correto dentro de rotas async.
+async def _exists_in_table(sup, table: str, field: str, value: str) -> bool:
+    res = await run_in_threadpool(
+        lambda: sup.table(table).select(field).eq(field, value).limit(1).execute()
+    )
+    u = _unwrap(res)
+    if u['error']:
+        raise RuntimeError(u['error'])
+    return bool(u['data'])
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await criar_pool()
+    await run_in_threadpool(criar_supabase)
     yield
-    await fechar_pool()
+    await run_in_threadpool(fechar_supabase)
 
 
 app = FastAPI(
@@ -39,6 +72,14 @@ app = FastAPI(
     description="Gerenciamento de estoque, locais físicos e movimentações.",
     version="2.0.0",
     lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -54,9 +95,11 @@ async def raiz():
 @app.get("/health", tags=["Geral"])
 async def health_check():
     try:
-        pool = get_pool()
-        async with pool.acquire() as conn:
-            await conn.fetchval("SELECT 1")
+        sup = get_supabase()
+        res = await run_in_threadpool(lambda: sup.table('local_fisico').select('id').limit(1).execute())
+        u = _unwrap(res)
+        if u['error']:
+            raise Exception(u['error'])
         return {"status": "ok", "banco": "conectado"}
     except Exception as e:
         return {"status": "erro", "detalhe": str(e)}
@@ -69,37 +112,40 @@ async def health_check():
 @app.get("/locais", response_model=List[LocalFisicoResposta], tags=["Local Físico"])
 async def listar_locais():
     """Lista todos os locais físicos cadastrados."""
-    pool = get_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("SELECT * FROM local_fisico ORDER BY nome ASC")
-    return [dict(r) for r in rows]
+    sup = get_supabase()
+    res = await run_in_threadpool(lambda: sup.table('local_fisico').select('*').execute())
+    u = _unwrap(res)
+    if u['error']:
+        raise HTTPException(status_code=500, detail=str(u['error']))
+    data = u['data'] or []
+    data.sort(key=lambda r: r.get('nome') or '')
+    return data
 
 
 @app.get("/locais/{local_id}", response_model=LocalFisicoResposta, tags=["Local Físico"])
 async def buscar_local(local_id: uuid.UUID):
     """Retorna um local físico pelo ID."""
-    pool = get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT * FROM local_fisico WHERE id = $1", local_id)
-    if row is None:
+    sup = get_supabase()
+    res = await run_in_threadpool(lambda: sup.table('local_fisico').select('*').eq('id', str(local_id)).execute())
+    u = _unwrap(res)
+    if u['error']:
+        raise HTTPException(status_code=500, detail=str(u['error']))
+    data = u['data'] or []
+    if not data:
         raise HTTPException(status_code=404, detail="Local físico não encontrado.")
-    return dict(row)
+    return data[0]
 
 
 @app.post("/locais", response_model=LocalFisicoResposta, status_code=201, tags=["Local Físico"])
 async def criar_local(local: LocalFisicoCriar):
     """Cria um novo local físico de armazenamento."""
-    pool = get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            INSERT INTO local_fisico (nome, descricao, ativo)
-            VALUES ($1, $2, $3)
-            RETURNING *
-            """,
-            local.nome, local.descricao, local.ativo,
-        )
-    return dict(row)
+    sup = get_supabase()
+    payload = local.model_dump()
+    res = await run_in_threadpool(lambda: sup.table('local_fisico').insert(payload).select('*').execute())
+    u = _unwrap(res)
+    if u['error']:
+        raise HTTPException(status_code=500, detail=str(u['error']))
+    return (u['data'] or [None])[0]
 
 
 @app.put("/locais/{local_id}", response_model=LocalFisicoResposta, tags=["Local Físico"])
@@ -109,70 +155,79 @@ async def atualizar_local(local_id: uuid.UUID, local: LocalFisicoAtualizar):
     if not campos:
         raise HTTPException(status_code=400, detail="Nenhum campo enviado para atualização.")
 
-    set_clause = ", ".join(f"{k} = ${i+1}" for i, k in enumerate(campos))
-    valores = list(campos.values()) + [local_id]
-
-    pool = get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            f"UPDATE local_fisico SET {set_clause} WHERE id = ${len(valores)} RETURNING *",
-            *valores,
-        )
-    if row is None:
+    sup = get_supabase()
+    res = await run_in_threadpool(lambda: sup.table('local_fisico').update(campos).eq('id', str(local_id)).select('*').execute())
+    u = _unwrap(res)
+    if u['error']:
+        raise HTTPException(status_code=500, detail=str(u['error']))
+    data = u['data'] or []
+    if not data:
         raise HTTPException(status_code=404, detail="Local físico não encontrado.")
-    return dict(row)
+    return data[0]
 
 
 @app.delete("/locais/{local_id}", status_code=200, tags=["Local Físico"])
 async def deletar_local(local_id: uuid.UUID):
     """Remove um local físico. Não é possível remover locais com estoque vinculado."""
-    pool = get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "DELETE FROM local_fisico WHERE id = $1 RETURNING id", local_id
-        )
-    if row is None:
+    sup = get_supabase()
+    res = await run_in_threadpool(lambda: sup.table('local_fisico').delete().eq('id', str(local_id)).select('id').execute())
+    u = _unwrap(res)
+    if u['error']:
+        raise HTTPException(status_code=500, detail=str(u['error']))
+    data = u['data'] or []
+    if not data:
         raise HTTPException(status_code=404, detail="Local físico não encontrado.")
     return {"mensagem": "Local físico excluído com sucesso."}
 
 
 # ══════════════════════════════════════════════════════════════
 #  ESTOQUE
+# ORDEM IMPORTA: rotas específicas (/produto/{id}) ANTES de /{id}
 # ══════════════════════════════════════════════════════════════
 
 @app.get("/estoques", response_model=List[EstoqueResposta], tags=["Estoque"])
 async def listar_estoques():
     """Lista todos os registros de estoque."""
-    pool = get_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("SELECT * FROM estoque ORDER BY created_at DESC")
-    return [dict(r) for r in rows]
+    sup = get_supabase()
+    res = await run_in_threadpool(lambda: sup.table('estoque').select('*').execute())
+    u = _unwrap(res)
+    if u['error']:
+        raise HTTPException(status_code=500, detail=str(u['error']))
+    data = u['data'] or []
+    data.sort(key=lambda r: r.get('created_at') or '', reverse=True)
+    return data
 
 
-@app.get("/estoques/{estoque_id}", response_model=EstoqueResposta, tags=["Estoque"])
-async def buscar_estoque(estoque_id: uuid.UUID):
-    """Retorna um registro de estoque pelo ID."""
-    pool = get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT * FROM estoque WHERE id = $1", estoque_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail="Registro de estoque não encontrado.")
-    return dict(row)
-
-
+# CORRIGIDO: rota específica declarada ANTES de /estoques/{estoque_id}
+# para o FastAPI não engolir "produto" como se fosse um UUID.
 @app.get("/estoques/produto/{produto_id}", response_model=List[EstoqueResposta], tags=["Estoque"])
 async def buscar_estoque_por_produto(produto_id: uuid.UUID):
     """
     Lista todos os registros de estoque de um produto específico
     (pode estar em múltiplos locais físicos).
     """
-    pool = get_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT * FROM estoque WHERE produto_id = $1 ORDER BY created_at DESC",
-            produto_id,
-        )
-    return [dict(r) for r in rows]
+    sup = get_supabase()
+    res = await run_in_threadpool(lambda: sup.table('estoque').select('*').eq('produto_id', str(produto_id)).execute())
+    u = _unwrap(res)
+    if u['error']:
+        raise HTTPException(status_code=500, detail=str(u['error']))
+    data = u['data'] or []
+    data.sort(key=lambda r: r.get('created_at') or '', reverse=True)
+    return data
+
+
+@app.get("/estoques/{estoque_id}", response_model=EstoqueResposta, tags=["Estoque"])
+async def buscar_estoque(estoque_id: uuid.UUID):
+    """Retorna um registro de estoque pelo ID."""
+    sup = get_supabase()
+    res = await run_in_threadpool(lambda: sup.table('estoque').select('*').eq('id', str(estoque_id)).execute())
+    u = _unwrap(res)
+    if u['error']:
+        raise HTTPException(status_code=500, detail=str(u['error']))
+    data = u['data'] or []
+    if not data:
+        raise HTTPException(status_code=404, detail="Registro de estoque não encontrado.")
+    return data[0]
 
 
 @app.post("/estoques", response_model=EstoqueResposta, status_code=201, tags=["Estoque"])
@@ -181,18 +236,27 @@ async def criar_estoque(estoque: EstoqueCriar):
     Cria um novo registro de estoque vinculando um produto a um local físico.
     O produto_id deve existir no sistema de Produtos (grupo externo).
     """
-    pool = get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            INSERT INTO estoque (produto_id, local_id, quantidade, quantidade_minima, quantidade_maxima)
-            VALUES ($1, $2, $3, $4, $5)
-            RETURNING *
-            """,
-            estoque.produto_id, estoque.local_id, estoque.quantidade,
-            estoque.quantidade_minima, estoque.quantidade_maxima,
+    sup = get_supabase()
+    payload = _normalize_payload(estoque.model_dump())
+
+    # CORRIGIDO: _exists_in_table agora é async, precisa de await
+    if not await _exists_in_table(sup, 'local_fisico', 'id', payload['local_id']):
+        raise HTTPException(
+            status_code=400,
+            detail=f"local_id '{payload['local_id']}' não foi encontrado em local_fisico.",
         )
-    return dict(row)
+
+    res = await run_in_threadpool(lambda: sup.table('estoque').insert(payload).select('*').execute())
+    u = _unwrap(res)
+    if u['error']:
+        message = str(u['error'])
+        if 'fk_estoque_local' in message or 'foreign key constraint' in message.lower():
+            raise HTTPException(
+                status_code=400,
+                detail="Erro de integridade referencial: local_id ou produto_id inválido.",
+            )
+        raise HTTPException(status_code=500, detail=message)
+    return (u['data'] or [None])[0]
 
 
 @app.put("/estoques/{estoque_id}", response_model=EstoqueResposta, tags=["Estoque"])
@@ -202,71 +266,94 @@ async def atualizar_estoque(estoque_id: uuid.UUID, estoque: EstoqueAtualizar):
     if not campos:
         raise HTTPException(status_code=400, detail="Nenhum campo enviado para atualização.")
 
-    set_clause = ", ".join(f"{k} = ${i+1}" for i, k in enumerate(campos))
-    valores = list(campos.values()) + [estoque_id]
+    sup = get_supabase()
 
-    pool = get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            f"UPDATE estoque SET {set_clause} WHERE id = ${len(valores)} RETURNING *",
-            *valores,
+    # CORRIGIDO: _exists_in_table agora é async, precisa de await
+    if 'local_id' in campos and not await _exists_in_table(sup, 'local_fisico', 'id', str(campos['local_id'])):
+        raise HTTPException(
+            status_code=400,
+            detail=f"local_id '{campos['local_id']}' não foi encontrado em local_fisico.",
         )
-    if row is None:
+
+    payload = _normalize_payload(campos)
+    res = await run_in_threadpool(lambda: sup.table('estoque').update(payload).eq('id', str(estoque_id)).select('*').execute())
+    u = _unwrap(res)
+    if u['error']:
+        message = str(u['error'])
+        if 'fk_estoque_local' in message or 'foreign key constraint' in message.lower():
+            raise HTTPException(
+                status_code=400,
+                detail="Erro de integridade referencial: local_id ou produto_id inválido.",
+            )
+        raise HTTPException(status_code=500, detail=message)
+    data = u['data'] or []
+    if not data:
         raise HTTPException(status_code=404, detail="Registro de estoque não encontrado.")
-    return dict(row)
+    return data[0]
 
 
 @app.delete("/estoques/{estoque_id}", status_code=200, tags=["Estoque"])
 async def deletar_estoque(estoque_id: uuid.UUID):
     """Remove um registro de estoque. As movimentações associadas são mantidas como histórico."""
-    pool = get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "DELETE FROM estoque WHERE id = $1 RETURNING id", estoque_id
-        )
-    if row is None:
+    sup = get_supabase()
+    res = await run_in_threadpool(lambda: sup.table('estoque').delete().eq('id', str(estoque_id)).select('id').execute())
+    u = _unwrap(res)
+    if u['error']:
+        raise HTTPException(status_code=500, detail=str(u['error']))
+    data = u['data'] or []
+    if not data:
         raise HTTPException(status_code=404, detail="Registro de estoque não encontrado.")
     return {"mensagem": "Registro de estoque excluído com sucesso."}
 
 
 # ══════════════════════════════════════════════════════════════
 #  MOVIMENTAÇÃO DE ESTOQUE
+# ORDEM IMPORTA: /estoque/{id} ANTES de /{id}
 # ══════════════════════════════════════════════════════════════
 
 @app.get("/movimentacoes", response_model=List[MovimentacaoResposta], tags=["Movimentação de Estoque"])
 async def listar_movimentacoes():
     """Lista todas as movimentações de estoque, da mais recente para a mais antiga."""
-    pool = get_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("SELECT * FROM movimentacao_estoque ORDER BY created_at DESC")
-    return [dict(r) for r in rows]
+    sup = get_supabase()
+    res = await run_in_threadpool(lambda: sup.table('movimentacao_estoque').select('*').execute())
+    u = _unwrap(res)
+    if u['error']:
+        raise HTTPException(status_code=500, detail=str(u['error']))
+    data = u['data'] or []
+    data.sort(key=lambda r: r.get('created_at') or '', reverse=True)
+    return data
+
+
+# CORRIGIDO: rota específica declarada ANTES de /movimentacoes/{movimentacao_id}
+@app.get("/movimentacoes/estoque/{estoque_id}", response_model=List[MovimentacaoResposta], tags=["Movimentação de Estoque"])
+async def listar_movimentacoes_por_estoque(estoque_id: uuid.UUID):
+    """Lista todas as movimentações de um registro de estoque específico."""
+    sup = get_supabase()
+    res = await run_in_threadpool(lambda: sup.table('movimentacao_estoque').select('*').eq('estoque_id', str(estoque_id)).execute())
+    u = _unwrap(res)
+    if u['error']:
+        raise HTTPException(status_code=500, detail=str(u['error']))
+    data = u['data'] or []
+    data.sort(key=lambda r: r.get('created_at') or '', reverse=True)
+    return data
 
 
 @app.get("/movimentacoes/{movimentacao_id}", response_model=MovimentacaoResposta, tags=["Movimentação de Estoque"])
 async def buscar_movimentacao(movimentacao_id: uuid.UUID):
     """Retorna uma movimentação específica pelo ID."""
-    pool = get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT * FROM movimentacao_estoque WHERE id = $1", movimentacao_id
-        )
-    if row is None:
+    sup = get_supabase()
+    res = await run_in_threadpool(lambda: sup.table('movimentacao_estoque').select('*').eq('id', str(movimentacao_id)).execute())
+    u = _unwrap(res)
+    if u['error']:
+        raise HTTPException(status_code=500, detail=str(u['error']))
+    data = u['data'] or []
+    if not data:
         raise HTTPException(status_code=404, detail="Movimentação não encontrada.")
-    return dict(row)
+    return data[0]
 
 
-@app.get("/movimentacoes/estoque/{estoque_id}", response_model=List[MovimentacaoResposta], tags=["Movimentação de Estoque"])
-async def listar_movimentacoes_por_estoque(estoque_id: uuid.UUID):
-    """Lista todas as movimentações de um registro de estoque específico."""
-    pool = get_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT * FROM movimentacao_estoque WHERE estoque_id = $1 ORDER BY created_at DESC",
-            estoque_id,
-        )
-    return [dict(r) for r in rows]
-
-
+# CORRIGIDO: apenas um decorador — múltiplos @app.post empilhados fazem
+# somente o último ficar ativo no FastAPI, os demais são ignorados.
 @app.post("/movimentacoes", response_model=MovimentacaoResposta, status_code=201, tags=["Movimentação de Estoque"])
 async def criar_movimentacao(mov: MovimentacaoCriar):
     """
@@ -276,49 +363,45 @@ async def criar_movimentacao(mov: MovimentacaoCriar):
     - tipo 'entrada': soma a quantidade ao estoque
     - tipo 'saida':   subtrai a quantidade do estoque (retorna 400 se insuficiente)
     """
-    if mov.tipo not in ("entrada", "saida"):
-        raise HTTPException(status_code=400, detail="Tipo deve ser 'entrada' ou 'saida'.")
+    sup = get_supabase()
 
-    pool = get_pool()
-    async with pool.acquire() as conn:
+    # Busca o estoque atual
+    res = await run_in_threadpool(lambda: sup.table('estoque').select('id,quantidade').eq('id', str(mov.estoque_id)).execute())
+    u = _unwrap(res)
+    if u['error']:
+        raise HTTPException(status_code=500, detail=str(u['error']))
+    data = u['data'] or []
+    if not data:
+        raise HTTPException(status_code=404, detail="Registro de estoque não encontrado.")
+    estoque_row = data[0]
 
-        # Verifica se o estoque existe e busca a quantidade atual
-        estoque_row = await conn.fetchrow(
-            "SELECT id, quantidade FROM estoque WHERE id = $1", mov.estoque_id
-        )
-        if estoque_row is None:
-            raise HTTPException(status_code=404, detail="Registro de estoque não encontrado.")
-
-        # Valida saldo disponível para saídas
-        if mov.tipo == "saida" and estoque_row["quantidade"] < mov.quantidade:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Saldo insuficiente. Disponível: {estoque_row['quantidade']}, solicitado: {mov.quantidade}.",
-            )
-
-        # Calcula nova quantidade
-        nova_qtd = (
-            estoque_row["quantidade"] + mov.quantidade
-            if mov.tipo == "entrada"
-            else estoque_row["quantidade"] - mov.quantidade
+    # Valida saldo disponível para saídas
+    if mov.tipo == MovimentacaoTipo.saida and estoque_row.get('quantidade', 0) < mov.quantidade:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Saldo insuficiente. Disponível: {estoque_row.get('quantidade', 0)}, solicitado: {mov.quantidade}.",
         )
 
-        # Atualiza estoque e registra movimentação em uma transação
-        async with conn.transaction():
-            await conn.execute(
-                "UPDATE estoque SET quantidade = $1 WHERE id = $2",
-                nova_qtd, mov.estoque_id,
-            )
-            row = await conn.fetchrow(
-                """
-                INSERT INTO movimentacao_estoque (estoque_id, tipo, quantidade, observacao)
-                VALUES ($1, $2, $3, $4)
-                RETURNING *
-                """,
-                mov.estoque_id, mov.tipo, mov.quantidade, mov.observacao,
-            )
+    # Calcula nova quantidade
+    nova_qtd = (
+        estoque_row.get('quantidade', 0) + mov.quantidade
+        if mov.tipo == MovimentacaoTipo.entrada
+        else estoque_row.get('quantidade', 0) - mov.quantidade
+    )
 
-    return dict(row)
+    # Atualiza estoque
+    upd = await run_in_threadpool(lambda: sup.table('estoque').update({'quantidade': nova_qtd}).eq('id', str(mov.estoque_id)).select('*').execute())
+    u_upd = _unwrap(upd)
+    if u_upd['error']:
+        raise HTTPException(status_code=500, detail=str(u_upd['error']))
+
+    # Registra a movimentação
+    payload = _normalize_payload(mov.model_dump())
+    res_ins = await run_in_threadpool(lambda: sup.table('movimentacao_estoque').insert(payload).select('*').execute())
+    u_ins = _unwrap(res_ins)
+    if u_ins['error']:
+        raise HTTPException(status_code=500, detail=str(u_ins['error']))
+    return (u_ins['data'] or [None])[0]
 
 
 @app.put("/movimentacoes/{movimentacao_id}", response_model=MovimentacaoResposta, tags=["Movimentação de Estoque"])
@@ -331,21 +414,24 @@ async def atualizar_movimentacao(movimentacao_id: uuid.UUID, mov: MovimentacaoAt
     if not campos:
         raise HTTPException(status_code=400, detail="Nenhum campo enviado para atualização.")
 
-    if "tipo" in campos and campos["tipo"] not in ("entrada", "saida"):
-        raise HTTPException(status_code=400, detail="Tipo deve ser 'entrada' ou 'saida'.")
+    # CORRIGIDO: campos["tipo"] agora pode ser MovimentacaoTipo (enum), não só string.
+    # O check anterior comparava enum com string e sempre falhava.
+    if "tipo" in campos:
+        tipo_val = campos["tipo"]
+        tipo_str = tipo_val.value if isinstance(tipo_val, MovimentacaoTipo) else str(tipo_val)
+        if tipo_str not in ("entrada", "saida"):
+            raise HTTPException(status_code=400, detail="Tipo deve ser 'entrada' ou 'saida'.")
+        campos["tipo"] = tipo_str  # garante que vai para o Supabase como string
 
-    set_clause = ", ".join(f"{k} = ${i+1}" for i, k in enumerate(campos))
-    valores = list(campos.values()) + [movimentacao_id]
-
-    pool = get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            f"UPDATE movimentacao_estoque SET {set_clause} WHERE id = ${len(valores)} RETURNING *",
-            *valores,
-        )
-    if row is None:
+    sup = get_supabase()
+    res = await run_in_threadpool(lambda: sup.table('movimentacao_estoque').update(campos).eq('id', str(movimentacao_id)).select('*').execute())
+    u = _unwrap(res)
+    if u['error']:
+        raise HTTPException(status_code=500, detail=str(u['error']))
+    data = u['data'] or []
+    if not data:
         raise HTTPException(status_code=404, detail="Movimentação não encontrada.")
-    return dict(row)
+    return data[0]
 
 
 @app.delete("/movimentacoes/{movimentacao_id}", status_code=200, tags=["Movimentação de Estoque"])
@@ -355,11 +441,12 @@ async def deletar_movimentacao(movimentacao_id: uuid.UUID):
     Atenção: não reverte automaticamente o saldo do estoque.
     Use com cuidado — prefira criar uma movimentação corretiva.
     """
-    pool = get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "DELETE FROM movimentacao_estoque WHERE id = $1 RETURNING id", movimentacao_id
-        )
-    if row is None:
+    sup = get_supabase()
+    res = await run_in_threadpool(lambda: sup.table('movimentacao_estoque').delete().eq('id', str(movimentacao_id)).select('id').execute())
+    u = _unwrap(res)
+    if u['error']:
+        raise HTTPException(status_code=500, detail=str(u['error']))
+    data = u['data'] or []
+    if not data:
         raise HTTPException(status_code=404, detail="Movimentação não encontrada.")
     return {"mensagem": "Movimentação excluída do histórico com sucesso."}

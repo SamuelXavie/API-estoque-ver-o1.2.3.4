@@ -2,7 +2,7 @@
 
 ## ⚡ Comandos Principais
 
-### 1. Primeira Execução (Setup Completo)
+### 2. Primeira Execução (Setup Completo)
 
 ```bash
 # Copiar variáveis de ambiente
